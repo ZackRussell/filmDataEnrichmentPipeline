@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Film Data Enrichment Pipeline</title>
+<style>
+  :root {
+    --bg: #0d0f0e; --bg2: #131614; --teal: #3ecfb2; --text: #e8ede9;
+    --muted: #7a8c82; --border: #242924;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
+    max-width: 720px; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; font-size: 0.9rem; }
+  .step {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1.5rem; margin-bottom: 1.5rem; display: none;
+  }
+  .step.active { display: block; }
+  .step h2 { font-size: 1rem; color: var(--teal); margin-bottom: 1rem; }
+  label { display: block; margin-bottom: 0.4rem; font-size: 0.85rem; color: var(--muted); }
+  select, input[type="file"], input[type="text"] {
+    width: 100%; padding: 0.6rem; margin-bottom: 1rem; background: var(--bg);
+    color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+  }
+  .radio-group { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
+  .radio-group label { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0; color: var(--text); }
+  button {
+    background: var(--teal); color: var(--bg); border: none; padding: 0.7rem 1.4rem;
+    border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 0.9rem;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .progress-bar { background: var(--border); height: 8px; border-radius: 4px; overflow: hidden; margin: 1rem 0; }
+  .progress-fill { background: var(--teal); height: 100%; width: 0%; transition: width 0.2s; }
+  .result-stat { display: inline-block; margin-right: 1.5rem; font-size: 0.9rem; }
+  .result-stat strong { color: var(--teal); }
+  .hint { font-size: 0.8rem; color: var(--muted); margin-top: -0.5rem; margin-bottom: 1rem; }
+  #error-box { color: #e87a7a; margin-top: 1rem; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>Film Data Enrichment Pipeline</h1>
+<p class="subtitle">Attach TMDB movie data (release date, runtime, genre, budget, revenue, ratings) to any movie dataset — a CSV or a SQLite table.</p>
+
+<div class="step active" id="step-source">
+  <h2>1. Provide your data</h2>
+  <div class="radio-group">
+    <label><input type="radio" name="source_type" value="csv" checked> CSV file</label>
+    <label><input type="radio" name="source_type" value="sqlite"> SQLite database</label>
+  </div>
+  <input type="file" id="file-input">
+  <div id="table-picker" style="display:none;">
+    <label for="table-select">Table</label>
+    <select id="table-select"></select>
+  </div>
+  <button id="btn-upload">Continue</button>
+  <div id="error-box"></div>
+</div>
+
+<div class="step" id="step-map">
+  <h2>2. Map your columns</h2>
+  <label for="title-col">Which column holds the movie title?</label>
+  <select id="title-col"></select>
+
+  <label for="date-col">Optional: a date/year column (used only as a soft disambiguator — see note)</label>
+  <select id="date-col"><option value="">None</option></select>
+  <p class="hint">Heads up: this pipeline doesn't assume what your date column means. If it's an awards ceremony year, a release year, or something else, it's used only to break ties when titles are ambiguous — it's never a hard filter.</p>
+
+  <label for="id-col">Optional: an ID column to carry through to the output (so you can join back to your source)</label>
+  <select id="id-col"><option value="">None (use row index)</option></select>
+
+  <button id="btn-map-continue">Continue</button>
+</div>
+
+<div class="step" id="step-output">
+  <h2>3. Choose where the enriched data goes</h2>
+  <div class="radio-group">
+    <label><input type="radio" name="output_type" value="csv" checked> CSV file</label>
+    <label><input type="radio" name="output_type" value="sqlite"> New SQLite table</label>
+  </div>
+  <label for="output-target">Output file name / table name</label>
+  <input type="text" id="output-target">
+  <p class="hint">A new table or file is always created — your source data is never modified.</p>
+  <button id="btn-run">Run Enrichment</button>
+</div>
+
+<div class="step" id="step-progress">
+  <h2>Running...</h2>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+  <p id="progress-text">0 / 0</p>
+</div>
+
+<div class="step" id="step-done">
+  <h2>Done</h2>
+  <div class="result-stat">Matched: <strong id="matched-count"></strong></div>
+  <div class="result-stat">Unmatched: <strong id="unmatched-count"></strong></div>
+  <p style="margin-top:1rem;"><a id="download-link" href="#"><button>Download Result</button></a></p>
+</div>
+
+<script>
+let state = {};
+
+const sourceTypeRadios = document.querySelectorAll('input[name="source_type"]');
+const fileInput = document.getElementById('file-input');
+const tablePicker = document.getElementById('table-picker');
+const tableSelect = document.getElementById('table-select');
+
+document.getElementById('btn-upload').addEventListener('click', async () => {
+  const sourceType = document.querySelector('input[name="source_type"]:checked').value;
+  const file = fileInput.files[0];
+  if (!file) { showError('Please choose a file.'); return; }
+
+  const formData = new FormData();
+  formData.append('source_type', sourceType);
+  formData.append('file', file);
+  if (sourceType === 'sqlite' && tableSelect.value) {
+    formData.append('table', tableSelect.value);
+  }
+
+  const res = await fetch('/api/upload', { method: 'POST', body: formData });
+  const data = await res.json();
+  if (data.error) { showError(data.error); return; }
+
+  state.source_type = data.source_type;
+  state.source_path = data.source_path;
+
+  if (sourceType === 'sqlite' && !state.table) {
+    if (data.tables) {
+      tablePicker.style.display = 'block';
+      tableSelect.innerHTML = data.tables.map(t => `<option value="${t}">${t}</option>`).join('');
+      return; // user picks a table, then clicks Continue again
+    }
+  }
+
+  state.table = data.table;
+  state.columns = data.columns;
+  goToStep('step-map');
+  populateColumnSelects(data.columns);
+});
+
+function populateColumnSelects(columns) {
+  const opts = columns.map(c => `<option value="${c}">${c}</option>`).join('');
+  document.getElementById('title-col').innerHTML = opts;
+  document.getElementById('date-col').innerHTML = '<option value="">None</option>' + opts;
+  document.getElementById('id-col').innerHTML = '<option value="">None (use row index)</option>' + opts;
+}
+
+document.getElementById('btn-map-continue').addEventListener('click', async () => {
+  state.title_column = document.getElementById('title-col').value;
+  state.date_column = document.getElementById('date-col').value;
+  state.id_column = document.getElementById('id-col').value;
+
+  const res = await fetch('/api/suggest-output', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_type: state.source_type, source_path: state.source_path }),
+  });
+  const data = await res.json();
+  document.querySelector(`input[name="output_type"][value="${data.suggested_type}"]`).checked = true;
+  document.getElementById('output-target').value = data.suggested_target;
+
+  goToStep('step-output');
+});
+
+document.getElementById('btn-run').addEventListener('click', async () => {
+  state.output_type = document.querySelector('input[name="output_type"]:checked').value;
+  state.output_target = document.getElementById('output-target').value;
+
+  goToStep('step-progress');
+
+  const res = await fetch('/api/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(state),
+  });
+  const { job_id } = await res.json();
+  pollStatus(job_id);
+});
+
+function pollStatus(jobId) {
+  const interval = setInterval(async () => {
+    const res = await fetch(`/api/status/${jobId}`);
+    const job = await res.json();
+
+    if (job.total > 0) {
+      const pct = Math.round((job.current / job.total) * 100);
+      document.getElementById('progress-fill').style.width = pct + '%';
+      document.getElementById('progress-text').textContent = `${job.current} / ${job.total}`;
+    }
+
+    if (job.status === 'complete') {
+      clearInterval(interval);
+      document.getElementById('matched-count').textContent = job.matched_count;
+      document.getElementById('unmatched-count').textContent = job.unmatched_count;
+      document.getElementById('download-link').href = `/api/download/${jobId}`;
+      goToStep('step-done');
+    } else if (job.status === 'error') {
+      clearInterval(interval);
+      showError(job.error);
+    }
+  }, 800);
+}
+
+function goToStep(stepId) {
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+  document.getElementById(stepId).classList.add('active');
+}
+
+function showError(msg) {
+  document.getElementById('error-box').textContent = msg;
+}
+
+sourceTypeRadios.forEach(r => r.addEventListener('change', (e) => {
+  tablePicker.style.display = e.target.value === 'sqlite' ? 'none' : 'none';
+}));
+</script>
+
+</body>
+</html>
